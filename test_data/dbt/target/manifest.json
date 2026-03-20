@@ -1,0 +1,50 @@
+{
+  "nodes": {
+    "model.my_dbt_project.users": {
+      "resource_type": "model",
+      "name": "users",
+      "unique_id": "model.my_dbt_project.users",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "description": "Unique identifier for a user."
+        },
+        "name": {
+          "name": "name",
+          "description": "User's full name."
+        },
+        "email": {
+          "name": "email",
+          "description": null
+        },
+        "created_at": {
+            "name": "created_at",
+            "description": "Timestamp when the user was created."
+        }
+      }
+    },
+    "model.my_dbt_project.orders": {
+        "resource_type": "model",
+        "name": "orders",
+        "unique_id": "model.my_dbt_project.orders",
+        "columns": {
+            "order_id": {
+                "name": "order_id",
+                "description": "The unique ID of the order."
+            },
+            "user_id": {
+                "name": "user_id",
+                "description": "ID of the user who placed the order."
+            },
+            "amount": {
+                "name": "amount",
+                "description": "The order amount."
+            },
+            "ordered_at": {
+                "name": "ordered_at",
+                "description": "Timestamp when the order was placed."
+            }
+        }
+    }
+  }
+}
