@@ -4,6 +4,7 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 import re
 import subprocess
+import lkml
 
 from app.dbt_parser import DbtParser
 from app.lookml_parser import LookMLParser
@@ -68,90 +69,158 @@ class DbtLookerSync:
 
         return sorted(candidates, key=lambda x: x[2]['new_fields'] + x[2]['missing_docs'], reverse=True)
 
-    def sync_models(self, models_to_sync: List[str]):
+    def sync_models(self, model_names: List[str], sync_mode: str = "both"):
         """
         Syncs a list of specified dbt models to their corresponding LookML views.
+        sync_mode can be 'both', 'docs' (only descriptions), or 'fields' (only new dimensions).
         """
         dbt_models = self.dbt_parser.models
-        all_candidates = self.get_sync_candidates()
-        candidates_map = {name: path for name, path, _ in all_candidates}
+        candidates = self.get_sync_candidates()
+        for model_name in model_names:
+            match = next((c for c in candidates if c[0] == model_name), None)
+            if match:
+                _, file_path, _ = match
+                dbt_model_data = dbt_models.get(model_name)
+                if dbt_model_data:
+                    self._sync_view(file_path, dbt_model_data, model_name, sync_mode)
 
-        for model_name in models_to_sync:
-            if model_name not in dbt_models:
-                console.log(f"[bold red]Model '{model_name}' not found in dbt project.[/bold red]")
-                continue
-            
-            dbt_model_data = dbt_models[model_name]
-            lookml_view_file = candidates_map.get(model_name)
-
-            if not lookml_view_file:
-                console.log(f"No matching LookML view found for dbt model [bold]{model_name}[/bold]. Skipping.")
-                continue
-
-            console.log(f"Syncing dbt model [bold]{model_name}[/bold] with LookML view [bold]{lookml_view_file.name}[/bold]")
-            self._sync_view(lookml_view_file, dbt_model_data, model_name)
-
-    def _sync_view(self, lookml_view_file: Path, dbt_model_data: Dict[str, Any], model_name: str):
+    def _sync_view(self, lookml_view_file: Path, dbt_model_data: Dict[str, Any], model_name: str, sync_mode: str = "both"):
         try:
-            lookml_data = self.lookml_parser.load_lookml_file(lookml_view_file)
+            with open(lookml_view_file, "r") as f:
+                original_content = f.read()
+
+            lookml_data = lkml.load(original_content)
             if "views" not in lookml_data or not lookml_data["views"]:
                 console.log(f"[yellow]No views found in {lookml_view_file.name}. Skipping.[/yellow]")
                 return
 
             view = lookml_data["views"][0]
-            changes = self._get_pending_changes(view, dbt_model_data)
+            all_changes = self.get_structured_pending_changes(view, dbt_model_data)
             
+            # Filter changes based on sync_mode
+            changes = []
+            if sync_mode == "both":
+                changes = all_changes
+            elif sync_mode == "docs":
+                changes = [c for c in all_changes if c["action"] == "Add description"]
+            elif sync_mode == "fields":
+                changes = [c for c in all_changes if c["action"] == "Add new dimension"]
+
             if not changes:
-                console.log(f"  [blue]No changes needed for {lookml_view_file.name}[/blue]")
+                console.log(f"  [blue]No matching changes needed for {lookml_view_file.name} with mode '{sync_mode}'[/blue]")
                 return
 
-            console.print(f"\n[bold yellow]Pending changes for {lookml_view_file.name}:[/bold yellow]")
-            for change in changes:
-                console.print(f"  {change}")
-
-            if Confirm.ask(f"\nApply these changes to [bold]{lookml_view_file.name}[/bold]?", default=False):
-                if not self.branch_created:
-                    self._ensure_git_safety(model_name)
-                
-                self._update_dimensions(view, dbt_model_data)
-                self.lookml_parser.save_lookml_file(lookml_view_file, lookml_data)
-                console.log(f"  [green]Successfully updated {lookml_view_file.name}[/green]")
-            else:
-                console.log(f"  [yellow]Skipped {lookml_view_file.name}[/yellow]")
+            if not self.branch_created:
+                self._ensure_git_safety(model_name)
+            
+            new_content = self._apply_changes_surgically(original_content, changes)
+            
+            with open(lookml_view_file, "w") as f:
+                f.write(new_content)
+            console.log(f"  [green]Successfully updated {lookml_view_file.name} (mode: {sync_mode})[/green]")
 
         except Exception as e:
             console.log(f"[bold red]Error syncing {lookml_view_file.name}: {e}[/bold red]")
+            import traceback
+            console.print(traceback.format_exc())
+
+    def _apply_changes_surgically(self, content: str, changes: List[Dict[str, str]]) -> str:
+        new_content = content
+        
+        for c in changes:
+            field_name = c["lookml_name"]
+            description = c["description"]
+            
+            if not description:
+                continue
+
+            if c["action"] == "Add description":
+                new_content = self._inject_description(new_content, field_name, description)
+            else:
+                new_content = self._inject_new_dimension(new_content, c["field"], description)
+        
+        return new_content
+
+    def _inject_description(self, content: str, field_name: str, description: str) -> str:
+        # Regex finds the dimension/measure block start
+        # Supports dimension: name { OR measure: name {
+        pattern = rf"(^\s*(?:dimension|measure|dimension_group|filter|parameter):\s*{field_name}\s*\{{)"
+        match = re.search(pattern, content, re.MULTILINE)
+        
+        if match:
+            start_pos = match.end()
+            # Find the end of this specific block to avoid leaking into other blocks
+            end_pos = self._find_block_end(content, start_pos)
+            block_content = content[start_pos:end_pos]
+            
+            if "description:" not in block_content:
+                safe_desc = description.replace('"', '\\"')
+                insertion = f"\n    description: \"{safe_desc}\""
+                return content[:start_pos] + insertion + content[start_pos:]
+        
+        return content
+
+    def _inject_new_dimension(self, content: str, col_name: str, description: str) -> str:
+        # Find the last closing brace of the view block
+        # Usually the last '}' in a well-formatted .view.lkml file
+        last_brace_index = content.rfind("}")
+        if last_brace_index == -1:
+            return content
+
+        safe_desc = description.replace('"', '\\"')
+        new_dim = f"\n  dimension: {col_name} {{\n    type: string\n    sql: ${{TABLE}}.{col_name} ;;\n    description: \"{safe_desc}\"\n  }}\n"
+        
+        return content[:last_brace_index] + new_dim + content[last_brace_index:]
+
+    def _find_block_end(self, content: str, start_pos: int) -> int:
+        brace_count = 1
+        for i in range(start_pos, len(content)):
+            if content[i] == "{":
+                brace_count += 1
+            elif content[i] == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    return i
+        return len(content)
 
     def _ensure_git_safety(self, model_name: str):
         branch_result = subprocess.run(["git", "branch", "--show-current"], cwd=self.lookml_project_dir, capture_output=True, text=True)
         current_branch = branch_result.stdout.strip()
         
-        if current_branch in ["main", "master"]:
-            console.log(f"[blue]On production branch [bold]{current_branch}[/bold]. Running git pull...[/blue]")
-            subprocess.run(["git", "pull"], cwd=self.lookml_project_dir, capture_output=True)
-        else:
-            console.print(f"[bold yellow]Warning: You are currently on branch '{current_branch}', not main/master.[/bold yellow]")
-            if not Confirm.ask("Do you want to continue using this branch as base?", default=False):
-                raise Exception("Sync aborted by user to switch branch.")
-
         status_result = subprocess.run(["git", "status", "--porcelain"], cwd=self.lookml_project_dir, capture_output=True, text=True)
-        if status_result.stdout.strip():
-            console.print("[bold yellow]Warning: You have uncommitted changes in your LookML repo.[/bold yellow]")
-            if not Confirm.ask("Do you want to continue anyway?", default=False):
-                raise Exception("Sync aborted by user due to uncommitted changes.")
+        has_uncommitted = bool(status_result.stdout.strip())
 
-        default_branch = f"dbt-sync-{model_name.replace('_', '-')}"
-        branch_name = Prompt.ask("\nEnter name for new Git branch", default=default_branch)
+        if current_branch in ["main", "master"]:
+            console.log(f"[blue]You are on production branch [bold]{current_branch}[/bold].[/blue]")
         
-        try:
-            subprocess.run(["git", "checkout", "-b", branch_name], cwd=self.lookml_project_dir, check=True, capture_output=True)
-            console.log(f"[green]Created branch [bold]{branch_name}[/bold].[/green]")
-            self.branch_created = True
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.decode().strip()
-            console.log(f"[bold red]Failed to create branch: {error_msg}[/bold red]")
-            if not Confirm.ask("Continue on current branch?", default=False):
-                raise Exception("Git branch creation failed.")
+        if has_uncommitted:
+            console.print("[bold yellow]Warning: You have uncommitted changes in your LookML repo.[/bold yellow]")
+
+        # Ask the user what they want to do
+        choice = Prompt.ask(
+            "\nGit strategy",
+            choices=["current", "new", "abort"],
+            default="new"
+        )
+
+        if choice == "abort":
+            raise Exception("Sync aborted by user.")
+        
+        if choice == "new":
+            default_branch = f"dbt-sync-{model_name.replace('_', '-')}"
+            branch_name = Prompt.ask("Enter name for new Git branch", default=default_branch)
+            try:
+                subprocess.run(["git", "checkout", "-b", branch_name], cwd=self.lookml_project_dir, check=True, capture_output=True)
+                console.log(f"[green]Created and switched to branch [bold]{branch_name}[/bold].[/green]")
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr.decode().strip()
+                console.log(f"[bold red]Failed to create branch: {error_msg}[/bold red]")
+                if not Confirm.ask("Continue on current branch instead?", default=False):
+                    raise Exception("Git branch creation failed.")
+        else:
+            console.log(f"[blue]Continuing on current branch [bold]{current_branch}[/bold].[/blue]")
+        
+        self.branch_created = True
 
     def _get_column_to_field_map(self, view: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """Maps dbt column names to LookML field objects by inspecting the 'sql' property."""
@@ -195,20 +264,42 @@ class DbtLookerSync:
                 
         return {"new_fields": new_fields, "missing_docs": missing_docs}
 
-    def _get_pending_changes(self, view: Dict[str, Any], dbt_model_data: Dict[str, Any]) -> List[str]:
+    def get_structured_pending_changes(self, view: Dict[str, Any], dbt_model_data: Dict[str, Any]) -> List[Dict[str, str]]:
         changes = []
         col_field_map = self._get_column_to_field_map(view)
         dbt_columns = dbt_model_data.get("columns", {})
 
         for col_name, col_data in dbt_columns.items():
-            dbt_description = col_data.get("description")
+            dbt_description = col_data.get("description", "")
             
             if col_name in col_field_map:
                 field = col_field_map[col_name]
                 if dbt_description and not field.get("description"):
-                    changes.append(f"[blue]Add description[/blue] to field using [bold]{col_name}[/bold] (LookML name: {field.get('name')})")
+                    changes.append({
+                        "field": col_name,
+                        "action": "Add description",
+                        "description": dbt_description,
+                        "lookml_name": field.get("name")
+                    })
             else:
-                changes.append(f"[green]Add new dimension[/green] [bold]{col_name}[/bold]")
+                changes.append({
+                    "field": col_name,
+                    "action": "Add new dimension",
+                    "description": dbt_description,
+                    "lookml_name": col_name
+                })
+
+        return changes
+
+    def _get_pending_changes(self, view: Dict[str, Any], dbt_model_data: Dict[str, Any]) -> List[str]:
+        changes = []
+        structured_changes = self.get_structured_pending_changes(view, dbt_model_data)
+        
+        for c in structured_changes:
+            if c["action"] == "Add description":
+                changes.append(f"[blue]Add description[/blue] to field using [bold]{c['field']}[/bold] (LookML name: {c['lookml_name']})")
+            else:
+                changes.append(f"[green]Add new dimension[/green] [bold]{c['field']}[/bold]")
 
         return changes
 
